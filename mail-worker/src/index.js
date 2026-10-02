@@ -11,7 +11,7 @@ export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
 
-    // 1. Resend Inbound Webhook 路由（第 13 行位置：绕过后台 JWT 鉴权）
+    // 1. Resend Inbound Webhook 路由（支持多别名穿透与数字验证码自动提取）
     if (url.pathname === '/webhook/resend' && req.method === 'POST') {
       try {
         const payload = await req.json();
@@ -28,6 +28,7 @@ export default {
 
         const apiKey = env.RESEND_API_KEY;
         let content = '';
+        let originalTo = '';
 
         if (emailId && apiKey) {
           try {
@@ -40,6 +41,14 @@ export default {
             if (res.ok) {
               const detail = await res.json();
               content = detail.text || detail.html || '';
+
+              // 从原始邮件 headers 中解析原始收件人
+              if (Array.isArray(detail.headers)) {
+                const toHeader = detail.headers.find(h => h.name?.toLowerCase() === 'to');
+                if (toHeader) originalTo = toHeader.value;
+              } else if (detail.headers?.to) {
+                originalTo = detail.headers.to;
+              }
             } else {
               console.error(`Fetch Resend email failed: ${res.status}`);
             }
@@ -54,10 +63,27 @@ export default {
                    || subject.match(/\b\d{6}\b/);
         const code = match ? (match[1] || match[0]) : null;
 
-        // 同步存入 KV（供 /m?e= 毫秒级轮询）
+        // 收集所有需要关联绑定的邮箱地址
+        const targetKeys = new Set([toAddress]);
+
+        // 1. 若 headers 中提取出原始收件人
+        if (originalTo) {
+          const extractedOriginal = originalTo.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+          if (extractedOriginal) targetKeys.add(extractedOriginal[0].toLowerCase().trim());
+        }
+
+        // 2. 从邮件正文中兜底提取包含的 @icloud.com 邮箱
+        const icloudMatch = content.match(/[a-zA-Z0-9._%+-]+@icloud\.com/i);
+        if (icloudMatch) {
+          targetKeys.add(icloudMatch[0].toLowerCase().trim());
+        }
+
+        // 批量存入 KV
         if (env.kv && code) {
-          await env.kv.put(`otp:${toAddress}`, code, { expirationTtl: 600 });
-          await env.kv.put(`raw:${toAddress}`, content.slice(0, 1000), { expirationTtl: 600 });
+          for (const emailKey of targetKeys) {
+            await env.kv.put(`otp:${emailKey}`, code, { expirationTtl: 600 });
+            await env.kv.put(`raw:${emailKey}`, content.slice(0, 1000), { expirationTtl: 600 });
+          }
         }
 
         // 存入 D1 数据库维持后台面板收件记录
@@ -83,7 +109,7 @@ export default {
           }
         }
 
-        return Response.json({ code: 200, status: 'success', extracted_code: code });
+        return Response.json({ code: 200, status: 'success', extracted_code: code, mapped_keys: Array.from(targetKeys) });
       } catch (err) {
         console.error('Webhook execution failed:', err);
         return Response.json({ code: 500, error: err.message }, { status: 500 });
@@ -102,13 +128,13 @@ export default {
 
     // 原有系统路由与鉴权逻辑
     if (url.pathname.startsWith('/api/')) {
-      url.pathname = url.pathname.replace('/api', '')
-      req = new Request(url.toString(), req)
+      url.pathname = url.pathname.replace('/api', '');
+      req = new Request(url.toString(), req);
       return app.fetch(req, env, ctx);
     }
 
     if (['/static/','/attachments/'].some(p => url.pathname.startsWith(p))) {
-      return await kvObjService.toObjResp( { env }, url.pathname.substring(1));
+      return await kvObjService.toObjResp({ env }, url.pathname.substring(1));
     }
 
     return env.assets.fetch(req);
@@ -116,14 +142,14 @@ export default {
   email: email,
   async scheduled(c, env, ctx) {
     if (c.cron === '*/30 * * * *') {
-      await analysisService.refreshEchartsCache({ env })
+      await analysisService.refreshEchartsCache({ env });
       return;
     }
 
-    await verifyRecordService.clearRecord({ env })
-    await userService.resetDaySendCount({ env })
-    await emailService.completeReceiveAll({ env })
-    await oauthService.clearNoBindOathUser({ env })
-    await analysisService.refreshEchartsCache({ env })
+    await verifyRecordService.clearRecord({ env });
+    await userService.resetDaySendCount({ env });
+    await emailService.completeReceiveAll({ env });
+    await oauthService.clearNoBindOathUser({ env });
+    await analysisService.refreshEchartsCache({ env });
   },
 };
